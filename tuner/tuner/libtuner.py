@@ -39,6 +39,7 @@ import random
 from abc import ABC, abstractmethod
 import iree.runtime as ireert
 from . import candidate_gen
+from . import candidate_gen_tk
 
 
 # Default values for num_candidates and devices, change it as needed
@@ -347,14 +348,15 @@ class ExecutionPhases(str, Enum):
     benchmark_models = "benchmark-models"
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(add_tk_args: bool = False) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Autotune script")
 
     # Required arguments
     required_args = parser.add_argument_group("Required Options")
-    required_args.add_argument(
-        "input_file", type=Path, help="Path to the input benchmark file (.mlir)"
-    )
+    if not add_tk_args:
+        required_args.add_argument(
+            "input_file", type=Path, help="Path to the input benchmark file (.mlir)"
+        )
 
     # General options
     general_args = parser.add_argument_group("General Options")
@@ -405,21 +407,50 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=-1,
     )
-    candidate_gen_args.add_argument(
-        "--lhs-dims", help="Map of LHS matmul dims", type=str, default="mk"
-    )
-    candidate_gen_args.add_argument(
-        "--rhs-dims", help="Map of RHS matmul dims", type=str, default="nk"
-    )
-    candidate_gen_args.add_argument(
-        "--tile-dims", help="Map of tile size matmul dims", type=str, default="mnk"
-    )
+
+    if not add_tk_args:
+        candidate_gen_args.add_argument(
+            "--lhs-dims", help="Map of LHS matmul dims", type=str, default="mk"
+        )
+        candidate_gen_args.add_argument(
+            "--rhs-dims", help="Map of RHS matmul dims", type=str, default="nk"
+        )
+        candidate_gen_args.add_argument(
+            "--tile-dims", help="Map of tile size matmul dims", type=str, default="mnk"
+        )
+    else:
+        candidate_gen_args.add_argument(
+            "-p", "--problem", help="Problem type", type=str, choices=["mmt", "conv"]
+        )
+        # GEMM-specific flags
+        candidate_gen_args.add_argument("-M", help="M dimension of GEMM", type=int)
+        candidate_gen_args.add_argument(
+            "-N", help="N dimension of GEMM or Batch size of conv", type=int
+        )
+        candidate_gen_args.add_argument("-K", help="K dimension of GEMM", type=int)
+        # Conv-specific flags
+        candidate_gen_args.add_argument("-OH", help="Output height of conv", type=int)
+        candidate_gen_args.add_argument("-OW", help="Output width of conv", type=int)
+        candidate_gen_args.add_argument("-OC", help="Output channels of conv", type=int)
+        candidate_gen_args.add_argument("-FH", help="Filter height of conv", type=int)
+        candidate_gen_args.add_argument("-FW", help="Filter width of conv", type=int)
+        candidate_gen_args.add_argument("-IC", help="Input channels of conv", type=int)
+        # Dtype flags
+        candidate_gen_args.add_argument(
+            "--input-dtype", help="Input dtype", type=str, default="f16"
+        )
+        candidate_gen_args.add_argument(
+            "--output-dtype", help="Output dtype", type=str, default="f32"
+        )
 
     return parser.parse_args()
 
 
 def setup_logging(args: argparse.Namespace, path_config: PathConfig):
-    log_file_name = f"autotune_{args.input_file.stem}.log"
+    if not hasattr(args, "input_file"):
+        log_file_name = f"autotune_{args.problem}.log"
+    else:
+        log_file_name = f"autotune_{args.input_file.stem}.log"
     run_log_path = path_config.base_dir / log_file_name
     path_config._set_run_log(run_log_path)
 
@@ -523,7 +554,7 @@ def create_worker_context_queue(device_ids: list[int]) -> queue.Queue[tuple[int,
 def run_command(run_pack: RunPack) -> TaskResult:
     command = run_pack.command
     check = run_pack.check
-    timeout_seconds = run_pack.timeout
+    timeout_seconds = run_pack.timeout_seconds
 
     result = None
     is_timeout = False
@@ -694,6 +725,86 @@ def append_to_file(lines: list[str], filepath: Path, title: str = "") -> None:
         file.write(title_str)
         file.writelines(lines)
         file.write("\n")
+
+
+def generate_candidates_tk(
+    args: argparse.Namespace,
+    path_config: PathConfig,
+    candidate_trackers: list[CandidateTracker],
+) -> list[int]:
+    from .candidate_gen_tk import (
+        ProblemSize,
+        DispatchKind,
+        MatmulSize,
+        ConvDimInfo,
+        ElementType,
+    )
+
+    mlirs = []
+    try:
+        logging.debug("Captured messages from candidate_gen.py:")
+        problem_size = None
+        input_dtype = ElementType.from_str(args.input_dtype)
+        output_dtype = ElementType.from_str(args.output_dtype)
+        if args.problem == "mmt":
+            problem_size = ProblemSize(
+                MatmulSize(args.M, args.N, args.K),
+                DispatchKind.mmt,
+                input_dtype,
+                output_dtype,
+            )
+        elif args.problem == "conv":
+            problem_size = ProblemSize(
+                ConvDimInfo(
+                    args.N, args.OH, args.OW, args.OC, args.FH, args.FW, args.IC
+                ),
+                DispatchKind.conv,
+                input_dtype,
+                output_dtype,
+            )
+        candidate_gen_tk.tune(
+            problem_size=problem_size,
+            output=str(path_config.candidates_dir),
+            limit=args.num_candidates,
+            num_subgroups=args.num_subgroups,
+        )
+        mlirs = sorted(
+            path_config.candidates_dir.glob("*.mlir"), key=numerical_sort_key
+        )
+    except Exception as e:
+        logging.error("An error occurred during candidates generation: %s", str(e))
+        # Capture and log debug messages from candidate_gen.py
+        tune_logger = logging.getLogger("tune")
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                tune_logger.handlers.append(handler)
+        tune_logger.exception("Error in candidate_gen.py:")
+        raise
+    logging.debug("candidate_gen.py ends")
+
+    candidate_configs = load_pickle(path_config.candidate_configs_pkl)
+
+    # Create candidate trackers
+    assert len(mlirs) == len(candidate_configs)
+    candidates = []
+    for mlir in mlirs:
+        candidates.append(int(mlir.stem))
+        new_candidate = CandidateTracker(
+            candidate_id=int(mlir.stem),
+            dispatch_mlir_path=mlir,
+            configuration=candidate_configs[int(mlir.stem)],
+        )
+        # We need to set the sizes in the benchmark command, so add them here.
+        new_candidate.args = args
+        candidate_trackers.append(new_candidate)
+
+    handle_error(
+        condition=(len(candidates) == 0), msg="Failed to generate any candidates"
+    )
+
+    logging.info(f"Generated [{len(candidates)}] candidates")
+
+    return candidates
 
 
 def generate_candidates(
@@ -900,10 +1011,9 @@ def parse_dispatch_benchmark_results(
         benchmark_time = res.get_mean_time()
         assert benchmark_time is not None
         candidate_trackers[candidate_id].first_benchmark_time = benchmark_time
-        candidate_trackers[
-            candidate_id
-        ].spec_path = path_config.specs_dir / path_config.get_candidate_spec_filename(
-            candidate_id
+        candidate_trackers[candidate_id].spec_path = (
+            path_config.specs_dir
+            / path_config.get_candidate_spec_filename(candidate_id)
         )
         mlir_path = candidate_trackers[candidate_id].dispatch_mlir_path
         spec_path = candidate_trackers[candidate_id].spec_path
@@ -935,7 +1045,9 @@ def generate_sample_task_result(
         stdout=stdout,
         returncode=0,
     )
-    return TaskResult(result=res, candidate_id=candidate_id, device_id=device_id)
+    return TaskResult(
+        run_result=RunResult(res, False), candidate_id=candidate_id, device_id=device_id
+    )
 
 
 def generate_dryrun_dispatch_benchmark_results(
@@ -1164,9 +1276,9 @@ def parse_model_benchmark_results(
     ]
 
     dump_list = []
-    incomplete_list: list[
-        tuple[int, Optional[str]]
-    ] = []  # format: [(candidate_id, device_id)]
+    incomplete_list: list[tuple[int, Optional[str]]] = (
+        []
+    )  # format: [(candidate_id, device_id)]
 
     baseline_time = None
     for same_device_results in grouped_benchmark_results:
@@ -1217,9 +1329,9 @@ def parse_model_benchmark_results(
                 calibrated_benchmark_diff = (
                     benchmark_time - baseline_time
                 ) / baseline_time
-                candidate_trackers[
-                    candidate_id
-                ].calibrated_benchmark_diff = calibrated_benchmark_diff
+                candidate_trackers[candidate_id].calibrated_benchmark_diff = (
+                    calibrated_benchmark_diff
+                )
             else:
                 calibrated_benchmark_diff = None
 
